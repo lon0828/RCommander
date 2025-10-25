@@ -1,6 +1,5 @@
 import socket
 import threading
-import pickle
 import struct
 import cv2
 import time
@@ -9,7 +8,7 @@ from picarx import Picarx  # SunFounder PiCar-X 제어 모듈
 # ==============================
 # 설정
 # ==============================
-CONTROL_HOST = "0.0.0.0"     # 명령 수신 서버 (C#이 여기에 연결)
+CONTROL_HOST = "0.0.0.0"     # 명령 수신 서버 (C#이 연결)
 CONTROL_PORT = 9000
 
 VIDEO_HOST = "192.168.0.23"  # 영상 수신할 PC IP
@@ -26,15 +25,14 @@ is_backward = False
 steer_dir = "center"  # "left", "right", "center"
 
 # ==============================
-# 차량 제어 함수
+# 차량 제어 루프
 # ==============================
 def control_loop():
     global is_forward, is_backward, steer_dir
     while True:
-        # 전진
+        # 전진/후진
         if is_forward:
             px.forward(30)
-        # 후진
         elif is_backward:
             px.backward(30)
         else:
@@ -51,7 +49,7 @@ def control_loop():
         time.sleep(0.05)
 
 # ==============================
-# 명령 수신 스레드
+# 명령 수신 서버
 # ==============================
 def command_server():
     global is_forward, is_backward, steer_dir
@@ -66,7 +64,6 @@ def command_server():
         data = conn.recv(1024)
         if not data:
             break
-
         cmd = data.decode().strip()
         print(f"[RECV] {cmd}")
 
@@ -89,27 +86,28 @@ def command_server():
             steer_dir = "right"
         elif cmd == "doff":
             steer_dir = "center"
-        # ----------------------------
 
     conn.close()
     server.close()
 
 # ==============================
-# 영상 송신 스레드
+# 영상 송신 클라이언트
 # ==============================
 def video_client():
     client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     client.connect((VIDEO_HOST, VIDEO_PORT))
     cam = cv2.VideoCapture(0)
-
+    cam.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+    cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
     print(f"[VIDEO] Connected to {VIDEO_HOST}:{VIDEO_PORT}")
 
     while True:
         ret, frame = cam.read()
         if not ret:
             break
-
-        data = pickle.dumps(frame)
+        # JPEG로 인코딩
+        _, buffer = cv2.imencode(".jpg", frame)
+        data = buffer.tobytes()
         size = struct.pack("L", len(data))
         client.sendall(size + data)
 
@@ -117,17 +115,9 @@ def video_client():
     client.close()
 
 # ==============================
-# 메인 실행
+# 메인
 # ==============================
 if __name__ == "__main__":
-    try:
-        # 차량 제어 루프
-        threading.Thread(target=control_loop, daemon=True).start()
-        # 명령 수신 서버
-        threading.Thread(target=command_server, daemon=True).start()
-        # 영상 송신
-        video_client()
-
-    except KeyboardInterrupt:
-        px.stop()
-        print("🛑 종료됨")
+    threading.Thread(target=control_loop, daemon=True).start()
+    threading.Thread(target=command_server, daemon=True).start()
+    video_client()
