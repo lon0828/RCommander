@@ -1,76 +1,133 @@
 import socket
 import threading
+import pickle
+import struct
 import cv2
-from picarx import Picarx
+import time
+from picarx import Picarx  # SunFounder PiCar-X 제어 모듈
+
+# ==============================
+# 설정
+# ==============================
+CONTROL_HOST = "0.0.0.0"     # 명령 수신 서버 (C#이 여기에 연결)
+CONTROL_PORT = 9000
+
+VIDEO_HOST = "192.168.0.23"  # 영상 수신할 PC IP
+VIDEO_PORT = 8000
+# ==============================
 
 px = Picarx()
 
-CONTROL_PORT = 5000
-VIDEO_PORT = 8080
-HOST = ''  # 모든 인터페이스
+# ==============================
+# 차량 제어 상태 변수
+# ==============================
+is_forward = False
+is_backward = False
+steer_dir = "center"  # "left", "right", "center"
 
-# -----------------------------
-# 제어 서버 (명령 수신)
-# -----------------------------
-def control_server():
+# ==============================
+# 차량 제어 함수
+# ==============================
+def control_loop():
+    global is_forward, is_backward, steer_dir
+    while True:
+        # 전진
+        if is_forward:
+            px.forward(30)
+        # 후진
+        elif is_backward:
+            px.backward(30)
+        else:
+            px.stop()
+
+        # 조향
+        if steer_dir == "left":
+            px.set_dir_servo_angle(-30)
+        elif steer_dir == "right":
+            px.set_dir_servo_angle(30)
+        else:
+            px.set_dir_servo_angle(0)
+
+        time.sleep(0.05)
+
+# ==============================
+# 명령 수신 스레드
+# ==============================
+def command_server():
+    global is_forward, is_backward, steer_dir
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind((HOST, CONTROL_PORT))
-    server.listen(5)
-    print("Control server running...")
+    server.bind((CONTROL_HOST, CONTROL_PORT))
+    server.listen(1)
+    print(f"[CONTROL] Waiting for connection on {CONTROL_PORT}...")
+    conn, addr = server.accept()
+    print(f"[CONTROL] Connected from {addr}")
 
     while True:
-        conn, addr = server.accept()
-        data = conn.recv(1024).decode().strip()
-        print("Received:", data)
+        data = conn.recv(1024)
+        if not data:
+            break
 
-        if data == "won":
-            px.forward(50)
-        elif data == "woff":
+        cmd = data.decode().strip()
+        print(f"[RECV] {cmd}")
+
+        # --------- 명령 처리 ---------
+        if cmd == "won":
+            is_forward = True
+        elif cmd == "woff":
+            is_forward = False
             px.stop()
-        elif data == "aon":
-            px.set_dir_servo_angle(-30)
-        elif data == "aoff":
-            px.set_dir_servo_angle(0)
-        elif data == "son":
-            px.backward(50)
-        elif data == "soff":
+        elif cmd == "son":
+            is_backward = True
+        elif cmd == "soff":
+            is_backward = False
             px.stop()
-        elif data == "don":
-            px.set_dir_servo_angle(30)
-        elif data == "doff":
-            px.set_dir_servo_angle(0)
+        elif cmd == "aon":
+            steer_dir = "left"
+        elif cmd == "aoff":
+            steer_dir = "center"
+        elif cmd == "don":
+            steer_dir = "right"
+        elif cmd == "doff":
+            steer_dir = "center"
+        # ----------------------------
 
-        conn.close()
+    conn.close()
+    server.close()
 
-# -----------------------------
-# 비디오 서버 (MJPEG 송신)
-# -----------------------------
-def video_server():
-    video_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    video_sock.bind((HOST, VIDEO_PORT))
-    video_sock.listen(1)
-    print("Video server running...")
+# ==============================
+# 영상 송신 스레드
+# ==============================
+def video_client():
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client.connect((VIDEO_HOST, VIDEO_PORT))
+    cam = cv2.VideoCapture(0)
 
-    conn, addr = video_sock.accept()
-    print("Video client connected:", addr)
+    print(f"[VIDEO] Connected to {VIDEO_HOST}:{VIDEO_PORT}")
 
-    cap = cv2.VideoCapture(0)
-    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
-
-    while cap.isOpened():
-        ret, frame = cap.read()
+    while True:
+        ret, frame = cam.read()
         if not ret:
             break
 
-        _, jpg = cv2.imencode('.jpg', frame, encode_param)
-        conn.sendall(jpg.tobytes())
+        data = pickle.dumps(frame)
+        size = struct.pack("L", len(data))
+        client.sendall(size + data)
 
-    cap.release()
-    conn.close()
+    cam.release()
+    client.close()
 
-# -----------------------------
+# ==============================
 # 메인 실행
-# -----------------------------
+# ==============================
 if __name__ == "__main__":
-    threading.Thread(target=control_server, daemon=True).start()
-    video_server()
+    try:
+        # 차량 제어 루프
+        threading.Thread(target=control_loop, daemon=True).start()
+        # 명령 수신 서버
+        threading.Thread(target=command_server, daemon=True).start()
+        # 영상 송신
+        video_client()
+
+    except KeyboardInterrupt:
+        px.stop()
+        print("🛑 종료됨")
