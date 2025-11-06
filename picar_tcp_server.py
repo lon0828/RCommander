@@ -67,10 +67,15 @@ control_conn = None
 control_conn_lock = threading.Lock()
 tread_count = 0
 tread_count_lock = threading.Lock()
+i2c_lock = threading.Lock()  # <<== 새로 추가된 I2C 락
 
 # 모터 상태
 motor_state = {"W": False, "A": False, "S": False, "D": False}
 motor_lock = threading.Lock()
+
+is_forward = False
+is_backward = False
+steer_dir = "center"
 
 # ===================== Helpers =====================
 def safe_send(conn, b):
@@ -85,99 +90,66 @@ def read_adc_values():
     if adc_left is None or adc_mid is None or adc_right is None:
         return None
     try:
-        l = float(adc_left.read())
-        m = float(adc_mid.read())
-        r = float(adc_right.read())
+        # I2C 버스 보호
+        with i2c_lock:
+            l = float(adc_left.read())
+            m = float(adc_mid.read())
+            r = float(adc_right.read())
         return l, m, r
     except Exception as e:
         log("ADC read error: " + repr(e))
         log(traceback.format_exc())
         return None
 
-# ===================== Command Server =====================
+# ===================== Motor Control =====================
+def control_loop():
+    global is_forward, is_backward, steer_dir
+    while True:
+        with i2c_lock:
+            if is_forward:
+                px.forward(100)
+            elif is_backward:
+                px.backward(30)
+            else:
+                px.stop()
+
+            if steer_dir == "left":
+                px.set_dir_servo_angle(-30)
+            elif steer_dir == "right":
+                px.set_dir_servo_angle(30)
+            else:
+                px.set_dir_servo_angle(0)
+        time.sleep(0.05)
+
+# ------------------------------
+# TCP 명령 수신
+# ------------------------------
 def command_server():
-    global control_conn
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((CONTROL_HOST, CONTROL_PORT))
-        s.listen(1)
-        log(f"[CONTROL] listening on {CONTROL_PORT}")
-    except Exception as e:
-        log("Failed to bind/listen control port: " + repr(e))
-        log(traceback.format_exc())
-        return
+    global is_forward, is_backward, steer_dir, control_conn
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind((CONTROL_HOST, CONTROL_PORT))
+    server.listen(1)
+    print(f"[CONTROL] Waiting on {CONTROL_PORT}")
+    conn, addr = server.accept()
+    control_conn = conn
+    print(f"[CONTROL] Connected from {addr}")
 
     while True:
-        try:
-            conn, addr = s.accept()
-            log(f"[CONTROL] client connected from {addr}")
-            with control_conn_lock:
-                control_conn = conn
-            while True:
-                data = conn.recv(1024)
-                if not data:
-                    log("[CONTROL] client closed socket")
-                    break
-                msg = data.decode(errors="ignore").strip()
-                log("[CONTROL][IN] " + repr(msg))
-                safe_send(conn, ("ECHO: " + msg + "\n").encode())
-                process_command(msg)
-        except Exception as e:
-            log("command_server loop error: " + repr(e))
-            log(traceback.format_exc())
-        finally:
-            with control_conn_lock:
-                try:
-                    if control_conn:
-                        control_conn.close()
-                except:
-                    pass
-                control_conn = None
-            log("[CONTROL] connection cleaned up")
+        data = conn.recv(1024)
+        if not data:
+            break
+        cmd = data.decode().strip()
+        if cmd == "won": is_forward = True
+        elif cmd == "woff": is_forward = False
+        elif cmd == "son": is_backward = True
+        elif cmd == "soff": is_backward = False
+        elif cmd == "aon": steer_dir = "left"
+        elif cmd == "aoff": steer_dir = "center"
+        elif cmd == "don": steer_dir = "right"
+        elif cmd == "doff": steer_dir = "center"
 
-# ===================== Motor Control =====================
-def process_command(cmd):
-    global tread_count
-    cmd = cmd.lower()
-    if cmd == "won":
-        with motor_lock:
-            motor_state["W"] = True
-            px.forward(100)
-    elif cmd == "woff":
-        with motor_lock:
-            motor_state["W"] = False
-            px.stop()
-    elif cmd == "son":
-        with motor_lock:
-            motor_state["S"] = True
-            px.backward(100)
-    elif cmd == "soff":
-        with motor_lock:
-            motor_state["S"] = False
-            px.stop()
-    elif cmd == "aon":
-        with motor_lock:
-            motor_state["A"] = True
-            px.set_dir_servo_angle(-30)
-    elif cmd == "aoff":
-        with motor_lock:
-            motor_state["A"] = False
-            px.set_dir_servo_angle(0)
-    elif cmd == "don":
-        with motor_lock:
-            motor_state["D"] = True
-            px.set_dir_servo_angle(30)
-    elif cmd == "doff":
-        with motor_lock:
-            motor_state["D"] = False
-            px.set_dir_servo_angle(0)
-    elif cmd == "tread":
-        with tread_count_lock:
-            tread_count += 1
-            log(f"[TREAD] Received tread count: {tread_count}")
-            if tread_count >= TREAD_MAX_COUNT:
-                log("[TREAD] Max tread count reached, stopping timer.")
+    conn.close()
+    server.close()
 
 # ===================== Sensor Watcher =====================
 def sensor_watcher():
@@ -192,13 +164,10 @@ def sensor_watcher():
             continue
         l, m, r = vals
         mx = max(l, m, r)
-        scale = 100.0 if mx <= 120 else 4095.0
+        scale = 4095.0
         th = scale * 0.35
         avg = (l+m+r)/3.0
-        if avg < scale*0.6:
-            is_black = (l<th) or (m<th) or (r<th)
-        else:
-            is_black = (l>scale*0.8) or (m>scale*0.8) or (r>scale*0.8)
+        is_black = avg > 10 and avg < 30
 
         log(f"[SENSOR] L={l:.1f} M={m:.1f} R={r:.1f} avg={avg:.1f} is_black={is_black}")
 
@@ -227,10 +196,14 @@ def sensor_watcher():
 
 # ===================== Main =====================
 try:
-    t1 = threading.Thread(target=command_server, daemon=True)
-    t1.start()
+    t3 = threading.Thread(target=control_loop, daemon=True)
+    t3.start()
+    time.sleep(1.0)  # 하드웨어 초기화 대기
     t2 = threading.Thread(target=sensor_watcher, daemon=True)
     t2.start()
+    t1 = threading.Thread(target=command_server, daemon=True)
+    t1.start()
+
     log("Threads started. Main loop now prints status every 5s.")
     while True:
         with control_conn_lock:
