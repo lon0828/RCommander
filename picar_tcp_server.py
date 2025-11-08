@@ -44,7 +44,7 @@ except Exception as e:
 CONTROL_HOST = "0.0.0.0"
 CONTROL_PORT = 9000
 SEND_MIN_INTERVAL = 0.5
-BLACK_THRESHOLD_COUNT = 3
+BLACK_THRESHOLD_COUNT = 2
 A0_NAME, A1_NAME, A2_NAME = "A0", "A1", "A2"
 TREAD_MAX_COUNT = 6  # tread 누적 시 자동 타이머 종료
 
@@ -167,7 +167,7 @@ def sensor_watcher():
         scale = 4095.0
         th = scale * 0.35
         avg = (l+m+r)/3.0
-        is_black = avg > 10 and avg < 30
+        is_black = avg > 4.5 and avg < 8.0
 
         log(f"[SENSOR] L={l:.1f} M={m:.1f} R={r:.1f} avg={avg:.1f} is_black={is_black}")
 
@@ -192,7 +192,7 @@ def sensor_watcher():
                 last_sent = now
             prev_black = True
             black_counter = 0
-        time.sleep(0.2)
+        time.sleep(0.01)
 
 # ===================== Main =====================
 try:
@@ -219,4 +219,5 @@ except Exception as e:
     log(traceback.format_exc())
 
 log("=== END ===")
+
 
